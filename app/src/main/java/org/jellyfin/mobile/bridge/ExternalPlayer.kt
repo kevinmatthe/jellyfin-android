@@ -9,8 +9,13 @@ import android.widget.Toast
 import androidx.activity.result.ActivityResultRegistry
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.net.toUri
+import androidx.core.os.bundleOf
 import androidx.core.text.isDigitsOnly
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.lifecycleScope
+import androidx.savedstate.SavedStateRegistryOwner
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.launch
 import org.jellyfin.mobile.R
@@ -51,12 +56,40 @@ class ExternalPlayer(
     private val externalPlayerProfile: DeviceProfile = deviceProfileBuilder.getExternalPlayerProfile()
     private val apiClient: ApiClient = get()
     private val videosApi: VideosApi = apiClient.videosApi
+    private val playlistScope = lifecycleOwner.lifecycleScope
+    private val playlistLifecycle = lifecycleOwner.lifecycle
+    private val savedStateRegistry = ((context as? SavedStateRegistryOwner) ?: (lifecycleOwner as? SavedStateRegistryOwner))
+        ?.savedStateRegistry
+    private val playlistSession = PLAYLIST_SESSIONS.get(
+        owner = registry,
+        restore = {
+            savedStateRegistry?.consumeRestoredStateForKey(PLAYLIST_STATE_KEY)?.getBoolean(PLAYLIST_AWAITING_RESULT) ?: false
+        },
+        registerSavedState = { awaitingResult ->
+            savedStateRegistry?.registerSavedStateProvider(PLAYLIST_STATE_KEY) {
+                // Activity-scoped ownership survives replacement of the server's WebViewFragment.
+                // Persist only this flag, never the queue, stream URLs, or credentials.
+                bundleOf(PLAYLIST_AWAITING_RESULT to awaitingResult())
+            }
+        },
+    )
+
+    init {
+        playlistLifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onStop(owner: LifecycleOwner) {
+                playlistSession.invalidatePending()
+            }
+        })
+    }
 
     private val playerContract = registry.register(
         "externalplayer",
         lifecycleOwner,
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
+        // This path bypasses ExtPlayer's single-item playback manager. A queue result cannot
+        // identify a watched item or position, including after Android recreates this fragment.
+        if (playlistSession.consumeResult()) return@register
         val resultCode = result.resultCode
         val intent = result.data
         when (val action = intent?.action) {
@@ -82,6 +115,72 @@ class ExternalPlayer(
     fun isEnabled() = appPreferences.videoPlayerType == VideoPlayerType.EXTERNAL_PLAYER
 
     @JavascriptInterface
+    fun supportsPlaylists(): Boolean = supportsMxPlaylists(
+        appPreferences.videoPlayerType,
+        appPreferences.externalPlayerApp,
+        context.packageManager::isPackageInstalled,
+    )
+
+    @JavascriptInterface
+    fun initPlaylist(args: String) {
+        val playbackContext = capturePlaylistContext()
+        val request = ExternalPlaylistRequest.parse(args)
+        playlistScope.launch {
+            if (request == null) {
+                context.toast(R.string.player_error_invalid_play_options)
+                return@launch
+            }
+            if (!supportsPlaylists()) {
+                context.toast(R.string.external_playlist_requires_mx, Toast.LENGTH_LONG)
+                return@launch
+            }
+            if (playbackContext == null || !isCurrentPlaylistContext(playbackContext)) {
+                context.toast(R.string.external_playlist_canceled)
+                return@launch
+            }
+            if (playlistSession.isBusy()) {
+                context.toast(R.string.external_playlist_busy)
+                return@launch
+            }
+            context.toast(R.string.external_playlist_loading, Toast.LENGTH_LONG)
+            val outcome = playlistSession.play(
+                ids = request.ids,
+                isCurrent = { isCurrentPlaylistContext(playbackContext) },
+                resolve = { itemId ->
+                    mediaSourceResolver.resolveMediaSource(
+                        itemId = itemId,
+                        deviceProfile = externalPlayerProfile,
+                        maxStreamingBitrate = Int.MAX_VALUE,
+                        autoOpenLiveStream = false,
+                    ).getOrThrow()
+                },
+            ) { sources ->
+                // No player opens until every requested source has resolved successfully.
+                val videos = sources.map { source ->
+                    MxPlaylistVideo(
+                        videosApi.getVideoStreamUrl(
+                            itemId = source.itemId,
+                            static = true,
+                            mediaSourceId = source.id,
+                            playSessionId = source.playSessionId,
+                        ).toUri(),
+                        source.getName(context),
+                    )
+                }
+                check(isCurrentPlaylistContext(playbackContext) && supportsPlaylists())
+                val component = requireNotNull(getComponent(playbackContext.playerPackage))
+                playerContract.launch(Intent(Intent.ACTION_VIEW).withMxPlaylist(component, videos))
+            }
+            when (outcome) {
+                ExternalPlaylistSession.Outcome.FAILED -> context.toast(R.string.external_playlist_error, Toast.LENGTH_LONG)
+                ExternalPlaylistSession.Outcome.CANCELED -> context.toast(R.string.external_playlist_canceled)
+                ExternalPlaylistSession.Outcome.BUSY -> context.toast(R.string.external_playlist_busy)
+                ExternalPlaylistSession.Outcome.STARTED -> Unit
+            }
+        }
+    }
+
+    @JavascriptInterface
     fun initPlayer(args: String) {
         val playOptions = PlayOptions.fromJson(args)
         val itemId = playOptions?.run {
@@ -91,27 +190,35 @@ class ExternalPlayer(
             context.toast(R.string.player_error_invalid_play_options)
             return
         }
+        if (!playlistSession.beginSinglePlayback()) {
+            context.toast(R.string.external_playlist_busy)
+            return
+        }
 
         coroutinesScope.launch {
-            // Resolve media source to query info about external (subtitle) streams
-            mediaSourceResolver.resolveMediaSource(
-                itemId = itemId,
-                mediaSourceId = playOptions.mediaSourceId,
-                deviceProfile = externalPlayerProfile,
-                startTime = playOptions.startPosition,
-                audioStreamIndex = playOptions.audioStreamIndex,
-                subtitleStreamIndex = playOptions.subtitleStreamIndex,
-                maxStreamingBitrate = Int.MAX_VALUE, // ensure we always direct play
-                autoOpenLiveStream = false,
-            ).onSuccess { jellyfinMediaSource ->
-                playMediaSource(playOptions, jellyfinMediaSource)
-            }.onFailure { error ->
-                when (error as? PlayerException) {
-                    is PlayerException.InvalidPlayOptions -> context.toast(R.string.player_error_invalid_play_options)
-                    is PlayerException.NetworkFailure -> context.toast(R.string.player_error_network_failure)
-                    is PlayerException.UnsupportedContent -> context.toast(R.string.player_error_unsupported_content)
-                    null -> throw error // Unknown error, rethrow from here
+            try {
+                // Resolve media source to query info about external (subtitle) streams
+                mediaSourceResolver.resolveMediaSource(
+                    itemId = itemId,
+                    mediaSourceId = playOptions.mediaSourceId,
+                    deviceProfile = externalPlayerProfile,
+                    startTime = playOptions.startPosition,
+                    audioStreamIndex = playOptions.audioStreamIndex,
+                    subtitleStreamIndex = playOptions.subtitleStreamIndex,
+                    maxStreamingBitrate = Int.MAX_VALUE, // ensure we always direct play
+                    autoOpenLiveStream = false,
+                ).onSuccess { jellyfinMediaSource ->
+                    playMediaSource(playOptions, jellyfinMediaSource)
+                }.onFailure { error ->
+                    when (error as? PlayerException) {
+                        is PlayerException.InvalidPlayOptions -> context.toast(R.string.player_error_invalid_play_options)
+                        is PlayerException.NetworkFailure -> context.toast(R.string.player_error_network_failure)
+                        is PlayerException.UnsupportedContent -> context.toast(R.string.player_error_unsupported_content)
+                        null -> throw error // Unknown error, rethrow from here
+                    }
                 }
+            } finally {
+                playlistSession.finishSingleResolution()
             }
         }
     }
@@ -164,7 +271,13 @@ class ExternalPlayer(
             // VLC
             if (enabledSubUrl != null) putExtra("subtitles_location", enabledSubUrl)
         }
-        playerContract.launch(playerIntent)
+        playlistSession.onSinglePlayerLaunch()
+        try {
+            playerContract.launch(playerIntent)
+        } catch (error: Exception) {
+            playlistSession.onSinglePlayerLaunchFailure()
+            throw error
+        }
         Timber.d(
             "Starting playback [id=${source.itemId}, title=${source.getName(context)}, " +
                 "playMethod=${source.playMethod}, startTime=${source.startTime}]",
@@ -358,7 +471,51 @@ class ExternalPlayer(
         }
     }
 
+    private fun capturePlaylistContext(): PlaylistContext? {
+        val generation = appPreferences.playbackContextGeneration
+        val baseUrl = apiClient.baseUrl?.takeIf(String::isNotBlank) ?: return null
+        val accessToken = apiClient.accessToken?.takeIf(String::isNotBlank) ?: return null
+        val serverId = appPreferences.currentServerId ?: return null
+        val userId = appPreferences.currentUserId ?: return null
+        return PlaylistContext(
+            generation,
+            baseUrl,
+            accessToken,
+            apiClient.deviceInfo.id,
+            serverId,
+            userId,
+            appPreferences.externalPlayerApp,
+            appPreferences.videoPlayerType,
+        )
+    }
+
+    private fun isCurrentPlaylistContext(snapshot: PlaylistContext): Boolean =
+        snapshot.generation == appPreferences.playbackContextGeneration &&
+            playlistLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) &&
+            snapshot.baseUrl == apiClient.baseUrl &&
+            snapshot.accessToken == apiClient.accessToken &&
+            snapshot.deviceId == apiClient.deviceInfo.id &&
+            snapshot.serverId == appPreferences.currentServerId &&
+            snapshot.userId == appPreferences.currentUserId &&
+            snapshot.playerPackage == appPreferences.externalPlayerApp &&
+            snapshot.playerMode == appPreferences.videoPlayerType
+
+    // Deliberately not a data class: its generated toString would expose the access token.
+    private class PlaylistContext(
+        val generation: Long,
+        val baseUrl: String,
+        val accessToken: String,
+        val deviceId: String,
+        val serverId: Long,
+        val userId: Long,
+        val playerPackage: String,
+        val playerMode: String,
+    )
+
     companion object {
+        private const val PLAYLIST_STATE_KEY = "externalplayer.mx_playlist"
+        private const val PLAYLIST_AWAITING_RESULT = "awaiting_result"
+        private val PLAYLIST_SESSIONS = ExternalPlaylistSessionStore()
         private val ALLOWED_EVENTS = arrayOf(
             Constants.EVENT_CANCELED,
             Constants.EVENT_ENDED,

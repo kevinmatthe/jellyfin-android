@@ -87,6 +87,11 @@
     <string name="external_player_not_supported_yet">Playback tracking not supported in selected external player yet. Contact developers to try to add support for it.</string>
     <string name="external_player_invalid_player">No valid external player selected. Playback tracking disabled.</string>
     <string name="external_player_unknown_error">Unknown error in external player. Playback tracking disabled.</string>
+    <string name="external_playlist_loading">Preparing the complete MX playlist…</string>
+    <string name="external_playlist_busy">Playback is already opening or running.</string>
+    <string name="external_playlist_requires_mx">Choose an installed MX Player as the external player first.</string>
+    <string name="external_playlist_error">Unable to prepare the complete playlist.</string>
+    <string name="external_playlist_canceled">Playlist request canceled.</string>
 
     <string name="activity_name_settings">Jellyfin Settings</string>
     <string name="pref_category_music_player">Music player</string>

@@ -11,14 +11,38 @@ import org.jellyfin.mobile.settings.ExternalPlayerPackage
 import org.jellyfin.mobile.settings.VideoPlayerType
 import org.jellyfin.mobile.utils.Constants
 import org.jellyfin.sdk.model.api.MediaSegmentType
+import java.util.concurrent.atomic.AtomicLong
 
 class AppPreferences(context: Context) {
     private val sharedPreferences: SharedPreferences =
         context.getSharedPreferences("${context.packageName}_preferences", Context.MODE_PRIVATE)
 
+    private val playbackGeneration = AtomicLong()
+
+    val playbackContextGeneration: Long
+        get() = playbackGeneration.get()
+
+    // SharedPreferences only holds listeners weakly; keep this listener for the application's lifetime.
+    private val playbackPreferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        when (key) {
+            null, Constants.PREF_SERVER_ID, Constants.PREF_USER_ID,
+            Constants.PREF_VIDEO_PLAYER_TYPE, Constants.PREF_EXTERNAL_PLAYER_APP,
+            -> invalidatePlaybackContext()
+        }
+    }
+
+    init {
+        sharedPreferences.registerOnSharedPreferenceChangeListener(playbackPreferenceListener)
+    }
+
+    fun invalidatePlaybackContext() {
+        playbackGeneration.incrementAndGet()
+    }
+
     var currentServerId: Long?
         get() = sharedPreferences.getLong(Constants.PREF_SERVER_ID, -1).takeIf { it >= 0 }
         set(value) {
+            invalidatePlaybackContext()
             sharedPreferences.edit {
                 if (value != null) putLong(Constants.PREF_SERVER_ID, value) else remove(Constants.PREF_SERVER_ID)
             }
@@ -27,6 +51,7 @@ class AppPreferences(context: Context) {
     var currentUserId: Long?
         get() = sharedPreferences.getLong(Constants.PREF_USER_ID, -1).takeIf { it >= 0 }
         set(value) {
+            invalidatePlaybackContext()
             sharedPreferences.edit {
                 if (value != null) putLong(Constants.PREF_USER_ID, value) else remove(Constants.PREF_USER_ID)
             }
@@ -131,5 +156,8 @@ class AppPreferences(context: Context) {
     @ExternalPlayerPackage
     var externalPlayerApp: String
         get() = sharedPreferences.getString(Constants.PREF_EXTERNAL_PLAYER_APP, ExternalPlayerPackage.SYSTEM_DEFAULT)!!
-        set(value) = sharedPreferences.edit { putString(Constants.PREF_EXTERNAL_PLAYER_APP, value) }
+        set(value) {
+            invalidatePlaybackContext()
+            sharedPreferences.edit { putString(Constants.PREF_EXTERNAL_PLAYER_APP, value) }
+        }
 }

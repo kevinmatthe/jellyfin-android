@@ -73,6 +73,15 @@ android {
             applicationIdSuffix = ".debug"
             isDebuggable = true
         }
+
+        create("randomPlaylists") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".randomplaylists"
+            versionNameSuffix = "-mx-playlists"
+            isDebuggable = false
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += "debug"
+        }
     }
 
     flavorDimensions += "variant"
@@ -119,6 +128,12 @@ android {
 
     room {
         schemaDirectory("$projectDir/schemas")
+    }
+}
+
+androidComponents {
+    beforeVariants(selector().withBuildType("randomPlaylists")) {
+        (it as com.android.build.api.variant.HasUnitTestBuilder).enableUnitTest = true
     }
 }
 
@@ -202,6 +217,7 @@ tasks {
     // Testing
     withType<Test> {
         useJUnit()
+        if (name == "testLibreRandomPlaylistsUnitTest") useJUnitPlatform()
         testLogging {
             events(
                 org.gradle.api.tasks.testing.logging.TestLogEvent.FAILED,

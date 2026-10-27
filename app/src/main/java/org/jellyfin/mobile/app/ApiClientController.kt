@@ -29,6 +29,7 @@ class ApiClientController(
         appPreferences.currentServerId = withContext(Dispatchers.IO) {
             serverDao.getServerByHostname(hostname)?.id ?: serverDao.insert(hostname)
         }
+        appPreferences.invalidatePlaybackContext()
         apiClient.update(baseUrl = hostname)
     }
 
@@ -78,10 +79,12 @@ class ApiClientController(
     }
 
     private fun configureApiClientServer(server: ServerEntity?) {
+        appPreferences.invalidatePlaybackContext()
         apiClient.update(baseUrl = server?.hostname)
     }
 
     private fun configureApiClientUser(userId: UUID, accessToken: String) {
+        appPreferences.invalidatePlaybackContext()
         apiClient.update(
             accessToken = accessToken,
             // Append user id to device id to ensure uniqueness across sessions
@@ -90,6 +93,7 @@ class ApiClientController(
     }
 
     private fun resetApiClientUser() {
+        appPreferences.invalidatePlaybackContext()
         apiClient.update(
             accessToken = null,
             deviceInfo = baseDeviceInfo,
